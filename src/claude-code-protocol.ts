@@ -275,14 +275,10 @@ export function patchClaudeCodeCch(serializedBody: string): string {
 		if (/; cch=[0-9a-f]{5};$/u.test(billingText)) return serializedBody;
 		throw new Error("Pi Black OAuth request has an invalid cch billing value");
 	}
-	if (typeof body.model !== "string" || !("max_tokens" in body)) {
-		throw new Error("Pi Black OAuth request is missing model or max_tokens");
-	}
-
-	const normalized = structuredClone(body);
-	normalized.model = "";
-	delete normalized.max_tokens;
-	const hashInput = JSON.stringify(normalized);
+	// Native engine normalization (reverse engineered from claude-code 2.1.295):
+// existing model -> "", max_tokens removed, every tools[i].model -> "" when present.
+const normalized=structuredClone(body);if("model"in normalized)normalized.model="";delete normalized.max_tokens;if(Array.isArray(normalized.tools))for(const tool of normalized.tools){if(isObject(tool)&&"model"in tool)tool.model="";}
+const hashInput=JSON.stringify(normalized);
 	const hash = xxHash64(new TextEncoder().encode(hashInput), CCH_SEED);
 	const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
 	body.system[0].text = billingText.replace(CCH_PLACEHOLDER, `cch=${cch}`);
@@ -346,6 +342,37 @@ export function isAnthropicOAuthToken(apiKey: string | undefined): boolean {
 	return apiKey?.includes("sk-ant-oat") === true;
 }
 
+// When PI_BLACK_HARNESS_URL is set (e.g. http://127.0.0.1:8321), route OAuth traffic
+// through the claude-harness native proxy (raw streaming at /forward/<absolute-url>):
+// the harness re-issues the request with claude-code's native engine (native TLS/HTTP
+// fingerprint and native cch injection for cch=00000 placeholders).
+const LOOPBACK_RE = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])([:/]|$)/i;
+
+// Read at call time so tests and embedders can set PI_BLACK_HARNESS_URL late.
+function harnessUrl(): string | undefined {
+	return process.env.PI_BLACK_HARNESS_URL?.replace(/\/+$/, "");
+}
+
+function wrapHarnessFetch(transport: FetchFunction): FetchFunction {
+	if (!harnessUrl()) return transport;
+	return (input, init) => {
+		const url =
+			typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.href
+					: input instanceof Request
+						? input.url
+						: String(input);
+		let target: string | URL | Request = input;
+		if (/^https?:\/\//i.test(url) && !LOOPBACK_RE.test(url)) {
+			target = `${harnessUrl()}/forward/${url}`;
+			if (input instanceof Request) target = new Request(target, input);
+		}
+		return transport(target, init);
+	};
+}
+
 export function mergeClaudeCodeOptions<T extends StreamOptions>(
 	options: T,
 	context: Context,
@@ -355,7 +382,7 @@ export function mergeClaudeCodeOptions<T extends StreamOptions>(
 		| Promise<ClaudeCodeIdentity | undefined>,
 ): T {
 	const originalOnPayload = options.onPayload;
-	const transport = options.fetch ?? globalThis.fetch;
+	const transport = wrapHarnessFetch(options.fetch ?? globalThis.fetch);
 	return {
 		...options,
 		headers: { ...options.headers, ...claudeCodeHeaders(options.sessionId) },
