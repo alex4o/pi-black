@@ -65,6 +65,85 @@ const ORACLES: Array<{ name: string; body: string; cch: string }> = [
       ],
     }),
   },
+  {
+    name: "nested model key inside message block (emptied at any depth)",
+    cch: "6c48a",
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      max_tokens: 32,
+      system: [{ type: "text", text: BILLING_CLI }],
+      messages: [
+        { role: "user", content: [{ type: "text", text: "nested", model: "NESTEDSECRET" }] },
+      ],
+    }),
+  },
+  {
+    name: "fallbacks + fallback_credit_token dropped, max_tokens last",
+    cch: "cafd5",
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      messages: [{ role: "user", content: "b" }],
+      fallbacks: [{ model: "a" }],
+      fallback_credit_token: "tok",
+      system: [{ type: "text", text: BILLING_CLI }],
+      tools: [{ name: "t", model: "m" }],
+      max_tokens: 64,
+    }),
+  },
+  {
+    name: "numeric model value left untouched",
+    cch: "7b3b5",
+    body: JSON.stringify({
+      model: 123,
+      max_tokens: 32,
+      system: [{ type: "text", text: BILLING_CLI }],
+      messages: [{ role: "user", content: "c" }],
+    }),
+  },
+  {
+    name: "single trailing max_tokens removed cleanly (no dangling comma)",
+    cch: "e36e6",
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      system: [{ type: "text", text: BILLING_CLI }],
+      messages: [{ role: "user", content: "d" }],
+      max_tokens: 64,
+    }),
+  },
+  {
+    name: "fallbacks alone in the middle",
+    cch: "49455",
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      messages: [{ role: "user", content: "e" }],
+      fallbacks: [{ model: "fb" }],
+      system: [{ type: "text", text: BILLING_CLI }],
+      max_tokens: 48,
+    }),
+  },
+  {
+    name: "two trailing excluded members keep the preceding comma",
+    cch: "f780f",
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      system: [{ type: "text", text: BILLING_CLI }],
+      messages: [{ role: "user", content: "f" }],
+      fallbacks: [],
+      max_tokens: 64,
+    }),
+  },
+  {
+    name: "three trailing excluded members keep the preceding comma",
+    cch: "2c970",
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      system: [{ type: "text", text: BILLING_CLI }],
+      messages: [{ role: "user", content: "g" }],
+      fallbacks: [{ model: "x" }],
+      fallback_credit_token: "t",
+      max_tokens: 64,
+    }),
+  },
 ];
 
 describe("patchClaudeCodeCch against native oracle values", () => {

@@ -247,6 +247,155 @@ export async function transformClaudeCodePayload(
 	return transformed;
 }
 
+const CCH_EXCLUDED_KEYS = new Set([
+	'"max_tokens"',
+	'"fallbacks"',
+	'"fallback_credit_token"',
+]);
+
+// Byte-level hash view matching the claude-code native engine (validated against
+// claude-code 2.1.220-2.1.295 wire samples): every "model" key whose value is a
+// string is emptied at any depth; max_tokens/fallbacks/fallback_credit_token
+// members are dropped from the view with the native comma rules (a trailing run
+// of two or more excluded members keeps the preceding comma). Everything else
+// stays byte-identical, so unusual escapes or number spellings never change the
+// hash.
+function cchHashInput(body: string): string {
+	const edits: Array<{ start: number; end: number }> = [];
+	let pos = 0;
+	const skipWhitespace = () => {
+		while (pos < body.length && " \t\r\n".includes(body[pos])) pos++;
+	};
+	const consume = (character: string) => {
+		if (body[pos] === character) {
+			pos++;
+			return true;
+		}
+		return false;
+	};
+	const parseString = (): [number, number] => {
+		const start = pos;
+		pos++;
+		while (pos < body.length) {
+			if (body[pos] === "\\") pos += 2;
+			else if (body[pos] === "\"") {
+				pos++;
+				return [start, pos];
+			} else pos++;
+		}
+		throw new Error("Pi Black cch input has an unterminated JSON string");
+	};
+	const parseValue = (collect: boolean): void => {
+		skipWhitespace();
+		if (body[pos] === "{") return parseObject(collect);
+		if (body[pos] === "[") {
+			pos++;
+			skipWhitespace();
+			if (consume("]")) return;
+			for (;;) {
+				parseValue(collect);
+				skipWhitespace();
+				if (consume(",")) continue;
+				if (consume("]")) return;
+				throw new Error("Pi Black cch input has invalid array syntax");
+			}
+		}
+		if (body[pos] === "\"") {
+			parseString();
+			return;
+		}
+		const start = pos;
+		while (pos < body.length && !",}] \t\r\n".includes(body[pos])) pos++;
+		if (pos === start)
+			throw new Error("Pi Black cch input has an invalid JSON value");
+	};
+	function parseObject(collect: boolean): void {
+		pos++;
+		skipWhitespace();
+		if (consume("}")) return;
+		const members: Array<{
+			start: number;
+			end: number;
+			commaBefore: number;
+			commaAfter: number;
+			excluded: boolean;
+		}> = [];
+		let commaBefore = -1;
+		for (;;) {
+			skipWhitespace();
+			const memberStart = pos;
+			const [keyStart, keyEnd] = parseString();
+			skipWhitespace();
+			if (!consume(":"))
+				throw new Error("Pi Black cch input is missing an object colon");
+			skipWhitespace();
+			const key = body.slice(keyStart, keyEnd);
+			const excluded = collect && CCH_EXCLUDED_KEYS.has(key);
+			if (collect && key === '"model"' && body[pos] === "\"") {
+				const [valueStart, valueEnd] = parseString();
+				edits.push({ start: valueStart + 1, end: valueEnd - 1 });
+			} else parseValue(collect && !excluded);
+			const memberEnd = pos;
+			skipWhitespace();
+			let commaAfter = -1;
+			if (consume(",")) commaAfter = pos - 1;
+			members.push({
+				start: memberStart,
+				end: memberEnd,
+				commaBefore,
+				commaAfter,
+				excluded,
+			});
+			if (commaAfter >= 0) {
+				commaBefore = commaAfter;
+				continue;
+			}
+			if (!consume("}"))
+				throw new Error("Pi Black cch input is missing an object end");
+			break;
+		}
+		if (collect) {
+			let index = 0;
+			while (index < members.length) {
+				if (!members[index].excluded) {
+					index++;
+					continue;
+				}
+				let last = index;
+				while (last + 1 < members.length && members[last + 1].excluded)
+					last++;
+				if (last + 1 < members.length)
+					edits.push({
+						start: members[index].start,
+						end: members[last].commaAfter + 1,
+					});
+				else if (index > 0 && last > index)
+					edits.push({ start: members[index].start, end: members[last].end });
+				else if (index > 0)
+					edits.push({
+						start: members[index].commaBefore,
+						end: members[last].end,
+					});
+				else
+					edits.push({ start: members[index].start, end: members[last].end });
+				index = last + 1;
+			}
+		}
+	}
+	parseValue(true);
+	skipWhitespace();
+	if (pos !== body.length)
+		throw new Error("Pi Black cch input has trailing JSON data");
+	edits.sort((a, b) => a.start - b.start);
+	let normalized = "";
+	let cursor = 0;
+	for (const edit of edits) {
+		normalized += body.slice(cursor, edit.start);
+		cursor = edit.end;
+	}
+	return normalized + body.slice(cursor);
+}
+
 export function patchClaudeCodeCch(serializedBody: string): string {
 	let body: JsonObject;
 	try {
@@ -275,10 +424,7 @@ export function patchClaudeCodeCch(serializedBody: string): string {
 		if (/; cch=[0-9a-f]{5};$/u.test(billingText)) return serializedBody;
 		throw new Error("Pi Black OAuth request has an invalid cch billing value");
 	}
-	// Native engine normalization (reverse engineered from claude-code 2.1.295):
-// existing model -> "", max_tokens removed, every tools[i].model -> "" when present.
-const normalized=structuredClone(body);if("model"in normalized)normalized.model="";delete normalized.max_tokens;if(Array.isArray(normalized.tools))for(const tool of normalized.tools){if(isObject(tool)&&"model"in tool)tool.model="";}
-const hashInput=JSON.stringify(normalized);
+	const hashInput = cchHashInput(serializedBody);
 	const hash = xxHash64(new TextEncoder().encode(hashInput), CCH_SEED);
 	const cch = (hash & 0xfffffn).toString(16).padStart(5, "0");
 	body.system[0].text = billingText.replace(CCH_PLACEHOLDER, `cch=${cch}`);
